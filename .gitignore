@@ -1,0 +1,7 @@
+# 개인 설정·실행 기록 (공유 금지: 닉네임·계정 아이디·처리한 글 목록이 들어 있음)
+config.json
+state.json
+last-report.json
+runs.log
+run.log
+run.lock
