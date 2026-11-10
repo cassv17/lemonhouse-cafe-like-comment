@@ -3,5 +3,6 @@
   "profileId": "",
   "expectNick": "",
   "naverId": "",
-  "taskSpaceName": "cafe like-comment"
+  "taskSpaceName": "cafe like-comment",
+  "skipMenuPattern": "문의|상담|견적|A/S"
 }

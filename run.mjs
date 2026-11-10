@@ -19,6 +19,9 @@ if (!cfg.profileId || !cfg.expectNick) throw new Error("config.json에 profileId
 const state = JSON.parse(await fs.readFile(DIR + "state.json", "utf8").catch(() => '{"lastRunAt":null,"done":{},"history":[]}'));
 const report = { runAt: kst(), mode: MODE, status: "ok", liked: 0, commented: 0, skipped: [], items: [] };
 
+// 고객 견적·상담 문의글(문의게시판, 비공개 글)은 직원이 답하는 곳이라 좋아요·댓글을 달지 않는다. config.json의 skipMenuPattern으로 바꿀 수 있다.
+const SKIP_MENU = new RegExp(cfg.skipMenuPattern || "문의|상담|견적|A/S");
+
 // ---------- 댓글 문구 ----------
 const COLORS = /(다크우드|화이트우드|라이트우드|크림베이지|웜베이지|화이트|우드|베이지|아이보리|그레이|블랙|그린|네이비|모던)/;
 function details(a) {
@@ -173,6 +176,7 @@ for (let p = 1; p <= 6; p++) {
     if (state.done[a.articleId]) continue;
     if (a.self) { report.skipped.push([a.articleId, "내 글"]); continue; }
     if (!a.enableComment || a.blindArticle) { report.skipped.push([a.articleId, "댓글 불가"]); continue; }
+    if (a.openArticle === false || SKIP_MENU.test(a.menuName || "")) { report.skipped.push([a.articleId, "문의·비공개 글"]); continue; }
     targets.push(a);
   }
   if (!list.length || (!ONLY && list[list.length - 1].writeDateTimestamp < since)) break;
@@ -214,6 +218,7 @@ const frameState = (T) => page.evaluate((T) => {
 }, T);
 
 let stopped = null;
+let apiFails = 0;
 try {
   for (let k = 0; k < targets.length; k++) {
     const a = targets[k];
@@ -237,6 +242,26 @@ try {
     // 다른 계정으로 로그인돼 있으면 아무것도 하지 않고 멈춘다(다른 업무 계정으로 카페 활동 방지)
     if (s.me !== cfg.expectNick) { it.result = `로그인 계정 '${s.me}'`; stopped = `WRONG_ACCOUNT: ${s.me} (기대: ${cfg.expectNick})`; break; }
 
+    // 댓글 목록(전체)을 먼저 읽는다. 읽을 수 없는 글은 좋아요도 누르지 않는다.
+    const apiRes = await page.fetch(`https://apis.naver.com/cafe-web/cafe-articleapi/v2.1/cafes/${CAFE}/articles/${a.articleId}?query=&useCafeId=true&requestFrom=A`, { timeout: 20000 }).catch(() => null);
+    if (apiRes && (apiRes.status === 401 || apiRes.status === 403)) {
+      it.result = `열람 제한(${apiRes.status}) - 건너뜀`;
+      state.done[a.articleId] = { at: kst(), skipped: "열람 제한" };
+      await save(false);
+      console.log(a.articleId, it.result);
+      continue;
+    }
+    let api = null;
+    try { if (apiRes?.ok) api = JSON.parse(apiRes.body).result?.comments?.items || []; } catch { api = null; }
+    if (!api) {
+      apiFails++;
+      it.result = "댓글 목록 확인 실패";
+      console.log(a.articleId, it.result, `(${apiFails}/3)`);
+      if (apiFails >= 3) { stopped = "COMMENT_CHECK_FAILED"; break; }
+      continue;
+    }
+    apiFails = 0;
+
     // 좋아요
     if (s.liked === false) {
       await page.click('loc=css:.ReactionLikeIt a.u_likeit_list_btn[data-type="like"]', { label: "like this article" });
@@ -253,9 +278,6 @@ try {
     } else it.like = s.liked ? "이미" : "버튼 없음";
 
     // 댓글: 화면 + 댓글 API(전체 댓글) 둘 다 보고, 내 닉네임 댓글이 하나라도 있으면 쓰지 않는다
-    const api = await page.fetch(`https://apis.naver.com/cafe-web/cafe-articleapi/v2.1/cafes/${CAFE}/articles/${a.articleId}?query=&useCafeId=true&requestFrom=A`, { timeout: 20000 })
-      .then((r) => (r.ok ? JSON.parse(r.body).result?.comments?.items || [] : null)).catch(() => null);
-    if (!api) { it.result = "댓글 목록 확인 실패"; stopped = "COMMENT_CHECK_FAILED"; break; }
     const mineApi = api.filter((c) => !c.isDeleted && c.writer?.nick === s.me).length;
     if (s.mine > 0 || mineApi > 0) it.comment = "이미 있음";
     else {
