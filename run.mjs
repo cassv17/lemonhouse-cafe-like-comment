@@ -217,13 +217,43 @@ const frameState = (T) => page.evaluate((T) => {
   };
 }, T);
 
+// ---- 입력 방식 원칙 ----
+// ego 창이 최소화돼 있으면 화면 높이가 0이 되어 마우스 입력(page.click·page.fill은 마우스로 스크롤·클릭한다)이 실패하거나 멈춘다.
+// 그래서 마우스를 쓰지 않고 DOM 스크롤 + 키보드(Enter, 텍스트 입력)로만 조작한다. 창이 최소화돼 있어도 동작한다.
+const LIKE_CSS = '.ReactionLikeIt a.u_likeit_list_btn[data-type="like"]';
+const dialogRe = /dialog is open|JavaScript (alert|confirm|prompt)/i;
+// 열린 alert/confirm 창을 닫는다. 네이버가 "이전 요청을 처리하고 있습니다." 같은 안내 alert를 띄우면 그 뒤 모든 동작이 막힌다.
+async function clearDialog() { try { await page.acceptDialog(); return true; } catch { return false; } }
+// 다시 실행해도 안전한 동작은 열린 alert 때문에 실패하면 닫고 한 번 더 시도한다
+async function guard(fn) {
+  try { return await fn(); }
+  catch (e) { if (dialogRe.test(String(e.message))) { await clearDialog(); return await fn(); } throw e; }
+}
+const scrollToSel = (sel) => guard(() => page.evaluate((sel) => { document.getElementById("cafe_main")?.contentDocument?.querySelector(sel)?.scrollIntoView({ block: "center" }); }, sel));
+const domClick = (sel) => guard(() => page.evaluate((sel) => { const el = document.getElementById("cafe_main")?.contentDocument?.querySelector(sel); if (!el) return false; el.click(); return true; }, sel));
+// 좋아요가 눌렸는지 최대 ms 동안 확인한다. 느린 응답을 실패로 오판해 두 번 누르는 일(취소·alert)을 막는다.
+async function waitLiked(ms) {
+  const end = Date.now() + ms; let st;
+  do { st = await guard(() => frameState("")); if (st.liked) return st; await page.waitForTimeout(700); } while (Date.now() < end);
+  return st;
+}
+const clearBox = () => guard(() => page.evaluate(() => { const ta = document.getElementById("cafe_main")?.contentDocument?.querySelector('textarea[placeholder="댓글을 남겨보세요"]'); if (ta) { ta.value = ""; ta.dispatchEvent(new Event("input", { bubbles: true })); } }));
+async function typeComment(T) {
+  await scrollToSel('textarea[placeholder="댓글을 남겨보세요"]');
+  await guard(() => page.focus(TA));
+  await page.keyboard.insertText(T);
+  await page.waitForTimeout(800);
+}
+
 let stopped = null;
 let apiFails = 0;
+let errFails = 0;
 try {
   for (let k = 0; k < targets.length; k++) {
     const a = targets[k];
     const it = { id: a.articleId, subject: a.subject.slice(0, 40) };
     report.items.push(it);
+    try {
     // 페이지가 늦게 뜨는 경우를 위해 최대 3번(점점 길게) 기다리고 새로고침한 뒤에야 로그인 풀림으로 판단한다
     let hasBox = false;
     for (let tryNo = 0; tryNo < 3 && !hasBox; tryNo++) {
@@ -262,17 +292,18 @@ try {
     }
     apiFails = 0;
 
-    // 좋아요
+    // 좋아요: 마우스 없이 DOM 스크롤 + 키보드 Enter. 안 눌리면 DOM click. 두 번 누르면 취소·alert가 나므로 충분히 기다린 뒤에만 다음 방법을 쓴다.
     if (s.liked === false) {
-      await page.click('loc=css:.ReactionLikeIt a.u_likeit_list_btn[data-type="like"]', { label: "like this article" });
-      await page.waitForTimeout(1500);
-      s = await frameState("");
+      await scrollToSel(LIKE_CSS);
+      await guard(() => page.focus("loc=css:" + LIKE_CSS));
+      await page.keyboard.press("Enter");
+      s = await waitLiked(10000);
       if (!s.liked) {
-        await page.focus('loc=css:.ReactionLikeIt a.u_likeit_list_btn[data-type="like"]');
-        await page.keyboard.press("Enter");
-        await page.waitForTimeout(1500);
-        s = await frameState("");
+        await clearDialog();
+        s = await waitLiked(3000);
+        if (!s.liked) { await domClick(LIKE_CSS); s = await waitLiked(10000); }
       }
+      await clearDialog();
       if (!s.liked) { it.result = "좋아요 실패"; stopped = "LIKE_FAILED"; break; }
       it.like = "새로"; report.liked++;
     } else it.like = s.liked ? "이미" : "버튼 없음";
@@ -286,9 +317,9 @@ try {
       for (let i = 0; i < 10 && texts.has(T); i++) T = makeComment(a);
       if (texts.has(T)) { it.result = "같은 문구 댓글 있음"; stopped = "DUPLICATE_TEXT"; break; }
       await page.waitForTimeout(rand(2000, 5000));
-      await page.fill(TA, T);
-      await page.waitForTimeout(800);
+      await typeComment(T);
       s = await frameState(T);
+      if (s.box !== T) { await clearBox(); await typeComment(T); s = await frameState(T); }
       if (s.box !== T) { it.result = "입력 실패"; stopped = "FILL_FAILED"; break; }
       await page.focus("loc=role:button[name='등록']");
       await page.keyboard.press("Enter");
@@ -299,9 +330,21 @@ try {
       it.comment = T; report.commented++;
       state.history.push(T);
     }
+    errFails = 0;
     state.done[a.articleId] = { at: kst(), like: it.like, comment: it.comment };
     await save(false);
     console.log(a.articleId, "좋아요:", it.like, "| 댓글:", it.comment);
+    } catch (e) {
+      // 글 하나의 일시 오류는 그 글만 건너뛰고(다음 실행 때 다시 시도) 계속한다. 3번 연속이면 멈춘다.
+      errFails++;
+      it.result = "오류: " + String(e.message).slice(0, 140);
+      console.log(a.articleId, it.result, `(${errFails}/3)`);
+      await clearDialog();
+      await save(false);
+      if (errFails >= 3) { stopped = "ERROR: " + String(e.message).slice(0, 140); break; }
+      await page.waitForTimeout(3000);
+      continue;
+    }
     if (k < targets.length - 1) await page.waitForTimeout(rand(20000, 30000));
   }
 } catch (e) {
@@ -318,6 +361,7 @@ if (stopped === "LOGIN_REQUIRED") {
   await toast("레몬하우스 카페 로그인 필요", "ego lite 전용 프로필에서 '로그인 상태 유지'를 켜고 네이버에 로그인한 뒤 run.ps1을 다시 실행하세요");
 } else if (stopped) {
   await toast("카페 좋아요·댓글 중단", `${stopped.slice(0, 80)} / 좋아요 ${report.liked} · 댓글 ${report.commented} (last-report.json)`);
+  await task.finish({ keep: [] }).catch(() => {});
 } else {
   if (report.liked || report.commented) await toast("카페 좋아요·댓글 완료", `새 글 ${targets.length}건: 좋아요 ${report.liked} · 댓글 ${report.commented}`);
   await task.finish({ keep: [] });
